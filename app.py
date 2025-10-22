@@ -167,56 +167,32 @@ if uploaded_files:
                 
                 # Create an expander for each file
                 with st.expander(f"{uploaded_file.name} - {verdict}", expanded=(i==0)):
-                    # Load audio for visualization (use mono for visualization)
-                    data, sr = load_audio(file_path, mono=True)
-                    
-                    # Display Analysis Results directly
-                    st.subheader("Analysis Results")
-                    st.markdown(f"**Verdict:** {verdict}")
-                    
-                    # Create three columns for metrics
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        st.metric("Sample Rate", f"{metrics['sample_rate']} Hz")
-                        st.metric("Frequency Cutoff", f"{metrics['cutoff_hz']:.1f} Hz")
-                    
-                    with col2:
-                        st.metric("Roll-off Slope", f"{metrics['rolloff_db_per_khz']:.1f} dB/kHz")
-                        st.metric("HF vs Mid Level", f"{metrics['hf_minus_mid_db']:.1f} dB")
-                    
-                    with col3:
-                        if metrics['hf_stereo_corr'] is not None:
-                            stereo_corr = f"{metrics['hf_stereo_corr']:.3f}"
-                            st.metric("HF Stereo Correlation", stereo_corr)
-                        else:
-                            st.metric("HF Stereo Correlation", "N/A (mono)")
-                        
-                        if "bitdepth" in metrics:
-                            st.metric("Bit Depth", metrics['bitdepth'])
-                    
-                    # Display Spectrogram
-                    st.subheader("Spectrogram")
-                    # Define the cutoff frequencies for classification display
-                    cutoffs_for_plot = [
-                        (18000, "MP3/Low-Bitrate Cutoff"),
-                        (21000, "High-Bitrate Transcode Cutoff")
-                    ]
-                    spec_img = plot_spectrogram(data, sr, classification_cutoffs=cutoffs_for_plot)
-                    st.image(spec_img)
-                    st.caption("Time-frequency representation of the audio signal, with lines indicating common lossy codec frequency cutoffs.")
-                
-                    # Display Frequency Spectrum
-                    st.subheader("Frequency Spectrum")
-                    spec_img = plot_spectrum(data, sr)
-                    st.image(spec_img)
-                    st.caption("Average frequency spectrum (with cutoff highlighted)")
-
                     # Add audio player
                     st.subheader("Play Audio")
                     # Read the file bytes for st.audio
                     audio_bytes = uploaded_file.getvalue() # Use getvalue() to get bytes
                     st.audio(audio_bytes, format=uploaded_file.type) # Pass file type for robustness
+
+                    if st.button("Generate Plots", key=f"plot_{i}"):
+                        # Load audio for visualization (use mono for visualization)
+                        data, sr = load_audio(file_path, mono=True)
+                        
+                        # Display Spectrogram
+                        st.subheader("Spectrogram")
+                        # Define the cutoff frequencies for classification display
+                        cutoffs_for_plot = [
+                            (18000, "MP3/Low-Bitrate Cutoff"),
+                            (21000, "High-Bitrate Transcode Cutoff")
+                        ]
+                        spec_img = plot_spectrogram(data, sr, classification_cutoffs=cutoffs_for_plot)
+                        st.image(spec_img)
+                        st.caption("Time-frequency representation of the audio signal, with lines indicating common lossy codec frequency cutoffs.")
+                    
+                        # Display Frequency Spectrum
+                        st.subheader("Frequency Spectrum")
+                        spec_img = plot_spectrum(data, sr)
+                        st.image(spec_img)
+                        st.caption("Average frequency spectrum (with cutoff highlighted)")
             
             except Exception as e:
                 st.error(f"Error analyzing {uploaded_file.name}: {str(e)}")
