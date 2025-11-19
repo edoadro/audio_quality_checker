@@ -15,6 +15,7 @@ Author: you 😊
 import sys
 import json
 from pathlib import Path
+import os
 
 import numpy as np
 import librosa          # audio loading / resampling
@@ -133,43 +134,83 @@ def classify(metrics):
     slope   = metrics["rolloff_db_per_khz"]
     hf_dif  = metrics["hf_minus_mid_db"]
     corr    = metrics["hf_stereo_corr"]
-    # ROLL_OFF_SLOPE_THRESHOLD is a global constant
 
-    base_classification = ""
     cutoff_kHz = cut / 1000.0
 
-    # Determine base classification from cutoff frequency table
-    if cut == 0.0 and slope == float('inf'): # Handle case from find_cutoff where no valid energy found
-        base_classification = "🛑 SILENCE OR NO DETECTABLE AUDIO CONTENT"
-    elif cutoff_kHz < 11.5: # ~11 kHz
-        base_classification = "🟥🟥🟥🟥🟥 ESTIMATED BITRATE: Very low (e.g. 64 kbps MP3). Observed Cutoff: ~{:.1f} kHz".format(cutoff_kHz)
-    elif cutoff_kHz < 17.0: # ~16 kHz (11.5kHz to <17kHz)
-        base_classification = "🚫🚫🚫🚫 ESTIMATED BITRATE: Around 128 kbps. Observed Cutoff: ~{:.1f} kHz".format(cutoff_kHz)
-    elif cutoff_kHz < 19.5: # ~18-19 kHz (17kHz to <19.5kHz)
-        base_classification = "⚠️⚠️⚠️ ESTIMATED BITRATE: Likely mid-high (e.g. 192–256 kbps). Observed Cutoff: ~{:.1f} kHz".format(cutoff_kHz)
-    elif cutoff_kHz < 21.0: # ~20 kHz (19.5kHz to <21kHz)
-        base_classification = "👍👍👍 ESTIMATED BITRATE: Near-max for MP3 (e.g. 320 kbps CBR). Observed Cutoff: ~{:.1f} kHz".format(cutoff_kHz)
-    elif cutoff_kHz <= 22.05: # ~22 kHz (21kHz to <=22.05kHz, Nyquist for 44.1kHz SR)
-        base_classification = "💿✅💿✅ ESTIMATED SOURCE: CD-quality audio (lossless 16-bit/44.1 kHz). Observed Cutoff: ~{:.1f} kHz".format(cutoff_kHz)
-    elif cutoff_kHz > 22.05: # >22 kHz content (ultrasonic)
-        base_classification = "🔊❇️🔊❇️ ESTIMATED SOURCE: High-res audio (e.g. 48 kHz+ sample rate). Observed Cutoff: >22 kHz ({:.1f} kHz)".format(cutoff_kHz)
-    else: # Fallback for any other case
-        base_classification = "CLEAN / LIKELY TRUE LOSSLESS (Cutoff: {:.1f} kHz)".format(cutoff_kHz)
+    # Handle silence or no detectable content first
+    if cut == 0.0 and slope == float('inf'):
+        return "🛑 SILENCE OR NO DETECTABLE AUDIO CONTENT"
 
-    # Check for specific patterns that might override or provide more detail (existing rules)
+    # Check for specific patterns (most specific to least specific)
     # Obvious lossy patterns
     if cut < 18000 and slope > ROLL_OFF_SLOPE_THRESHOLD and hf_dif < -50:
         return "LOSSY UPSAMPLED – likely MP3 ~128–192 kbps (Cutoff: {:.1f} kHz, Slope: {:.0f} dB/kHz, HF Diff: {:.0f} dB)".format(cutoff_kHz, slope, hf_dif)
-    
+
     # High‑bitrate lossy (e.g. 320 kbps AAC/MP3) pattern with suspicious stereo correlation
     if 18000 <= cut < 21000 and corr is not None and corr > 0.9 and hf_dif < -40:
         return "POSSIBLE HIGH‑BITRATE TRANSCODE (Cutoff: {:.1f} kHz, HF Corr: {:.2f}, HF Diff: {:.0f} dB)".format(cutoff_kHz, corr, hf_dif)
 
-    # If no specific patterns matched, return the base classification from the table.
-    return base_classification
+    # Determine base classification from cutoff frequency table
+    if cutoff_kHz < 11.5: # ~11 kHz
+        return "🟥🟥🟥🟥🟥 ESTIMATED BITRATE: Very low (e.g. 64 kbps MP3). Observed Cutoff: ~{:.1f} kHz".format(cutoff_kHz)
+    elif cutoff_kHz < 17.0: # ~16 kHz (11.5kHz to <17kHz)
+        return "🚫🚫🚫🚫 ESTIMATED BITRATE: Around 128 kbps. Observed Cutoff: ~{:.1f} kHz".format(cutoff_kHz)
+    elif cutoff_kHz < 19.5: # ~18-19 kHz (17kHz to <19.5kHz)
+        return "⚠️⚠️⚠️ ESTIMATED BITRATE: Likely mid-high (e.g. 192–256 kbps). Observed Cutoff: ~{:.1f} kHz".format(cutoff_kHz)
+    elif cutoff_kHz < 21.0: # ~20 kHz (19.5kHz to <21kHz)
+        return "👍👍👍 ESTIMATED BITRATE: Near-max for MP3 (e.g. 320 kbps CBR). Observed Cutoff: ~{:.1f} kHz".format(cutoff_kHz)
+    elif cutoff_kHz <= 22.05: # ~22 kHz (21kHz to <=22.05kHz, Nyquist for 44.1kHz SR)
+        return "💿✅💿✅ ESTIMATED SOURCE: CD-quality audio (lossless 16-bit/44.1 kHz). Observed Cutoff: ~{:.1f} kHz".format(cutoff_kHz)
+    else: # >22 kHz content (ultrasonic)
+        return "🔊❇️🔊❇️ ESTIMATED SOURCE: High-res audio (e.g. 48 kHz+ sample rate). Observed Cutoff: >22 kHz ({:.1f} kHz)".format(cutoff_kHz)
 
 
-def analyze_file(path):
+def detect_silence_tail(y, sr, silence_threshold_db=-50, min_silence_duration=1.0):
+    """
+    Detect silence at the end of an audio file.
+    Returns (has_silence_tail, silence_start_sample, silence_duration_seconds)
+    """
+    # Convert to mono if stereo
+    if y.ndim > 1:
+        y = np.mean(y, axis=0)
+
+    # Calculate RMS energy in frames
+    frame_length = 2048
+    hop_length = 512
+    rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+
+    # Convert to dB
+    rms_db = librosa.amplitude_to_db(rms, ref=np.max)
+
+    # Find frames below threshold
+    silent_frames = rms_db < silence_threshold_db
+
+    # Check from the end backwards to find continuous silence
+    total_frames = len(silent_frames)
+    silence_frame_count = 0
+
+    for i in range(total_frames - 1, -1, -1):
+        if silent_frames[i]:
+            silence_frame_count += 1
+        else:
+            break
+
+    # Convert frames to samples and duration
+    silence_samples = silence_frame_count * hop_length
+    silence_duration = silence_samples / sr
+
+    # Determine if silence is significant
+    has_silence = silence_duration >= min_silence_duration
+
+    if has_silence:
+        # Calculate where silence starts
+        silence_start_sample = len(y) - silence_samples
+        return True, silence_start_sample, silence_duration
+    else:
+        return False, None, 0.0
+
+
+def analyze_file(path, check_silence=False):
     data, sr = load_audio(path, mono=False)
     # ensure 2‑D array [channels, samples]
     if data.ndim == 1:
@@ -189,6 +230,15 @@ def analyze_file(path):
         "hf_stereo_corr": corr_val,
         **bitdepth
     }
+
+    # Optional silence detection
+    if check_silence:
+        has_silence, silence_start, silence_duration = detect_silence_tail(np.mean(data, axis=0), sr)
+        metrics["has_silence_tail"] = has_silence
+        if has_silence:
+            metrics["silence_start_sample"] = silence_start
+            metrics["silence_duration_sec"] = silence_duration
+
     # ensure every value is JSON‑serialisable
     metrics = {k: _json_safe(v) for k, v in metrics.items()}
 
