@@ -167,8 +167,8 @@ def classify(metrics):
 
 def detect_silence_tail(y, sr, silence_threshold_db=-50, min_silence_duration=1.0):
     """
-    Detect silence at the end of an audio file.
-    Returns (has_silence_tail, silence_start_sample, silence_duration_seconds)
+    Detect silence at the beginning and end of an audio file.
+    Returns (has_silence_start, silence_start_duration, has_silence_end, silence_end_duration)
     """
     # Convert to mono if stereo
     if y.ndim > 1:
@@ -185,29 +185,31 @@ def detect_silence_tail(y, sr, silence_threshold_db=-50, min_silence_duration=1.
     # Find frames below threshold
     silent_frames = rms_db < silence_threshold_db
 
-    # Check from the end backwards to find continuous silence
     total_frames = len(silent_frames)
-    silence_frame_count = 0
 
-    for i in range(total_frames - 1, -1, -1):
+    # Check from the beginning forward to find continuous silence
+    silence_start_frame_count = 0
+    for i in range(total_frames):
         if silent_frames[i]:
-            silence_frame_count += 1
+            silence_start_frame_count += 1
         else:
             break
 
-    # Convert frames to samples and duration
-    silence_samples = silence_frame_count * hop_length
-    silence_duration = silence_samples / sr
+    silence_start_duration = (silence_start_frame_count * hop_length) / sr
+    has_silence_start = silence_start_duration >= min_silence_duration
 
-    # Determine if silence is significant
-    has_silence = silence_duration >= min_silence_duration
+    # Check from the end backwards to find continuous silence
+    silence_end_frame_count = 0
+    for i in range(total_frames - 1, -1, -1):
+        if silent_frames[i]:
+            silence_end_frame_count += 1
+        else:
+            break
 
-    if has_silence:
-        # Calculate where silence starts
-        silence_start_sample = len(y) - silence_samples
-        return True, silence_start_sample, silence_duration
-    else:
-        return False, None, 0.0
+    silence_end_duration = (silence_end_frame_count * hop_length) / sr
+    has_silence_end = silence_end_duration >= min_silence_duration
+
+    return has_silence_start, silence_start_duration, has_silence_end, silence_end_duration
 
 
 def analyze_file(path, check_silence=False):
@@ -233,11 +235,14 @@ def analyze_file(path, check_silence=False):
 
     # Optional silence detection
     if check_silence:
-        has_silence, silence_start, silence_duration = detect_silence_tail(np.mean(data, axis=0), sr)
-        metrics["has_silence_tail"] = has_silence
-        if has_silence:
-            metrics["silence_start_sample"] = silence_start
-            metrics["silence_duration_sec"] = silence_duration
+        has_silence_start, silence_start_duration, has_silence_end, silence_end_duration = detect_silence_tail(np.mean(data, axis=0), sr)
+        metrics["has_silence_start"] = has_silence_start
+        metrics["silence_start_duration_sec"] = silence_start_duration
+        metrics["has_silence_end"] = has_silence_end
+        metrics["silence_end_duration_sec"] = silence_end_duration
+        # Keep old key for backward compatibility
+        metrics["has_silence_tail"] = has_silence_end
+        metrics["silence_duration_sec"] = silence_end_duration
 
     # ensure every value is JSON‑serialisable
     metrics = {k: _json_safe(v) for k, v in metrics.items()}

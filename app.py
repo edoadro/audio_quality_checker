@@ -97,6 +97,30 @@ def validate_file_path(file_path):
 
     return True, None
 
+def format_silence_info(row, min_display_threshold=3.0):
+    """
+    Format silence information for display.
+    Returns None if no significant silence, otherwise a descriptive string.
+    """
+    parts = []
+
+    # Check beginning silence
+    if row.get('has_silence_start', False):
+        duration = row.get('silence_start_duration_sec', 0.0)
+        if duration >= min_display_threshold:
+            parts.append(f"{duration:.0f}s at start")
+
+    # Check ending silence
+    if row.get('has_silence_end', False):
+        duration = row.get('silence_end_duration_sec', 0.0)
+        if duration >= min_display_threshold:
+            parts.append(f"{duration:.0f}s at end")
+
+    if parts:
+        return " + ".join(parts)
+    else:
+        return None
+
 def export_to_csv(results_data):
     """
     Export analysis results to CSV format.
@@ -378,6 +402,10 @@ if files_to_analyze:
                         'zero_lsb_fraction': metrics.get('zero_lsb_fraction'),
                         'has_silence_tail': metrics.get('has_silence_tail', False),
                         'silence_duration_sec': metrics.get('silence_duration_sec', 0.0),
+                        'has_silence_start': metrics.get('has_silence_start', False),
+                        'silence_start_duration_sec': metrics.get('silence_start_duration_sec', 0.0),
+                        'has_silence_end': metrics.get('has_silence_end', False),
+                        'silence_end_duration_sec': metrics.get('silence_end_duration_sec', 0.0),
                     }
                     analysis_results.append(result)
 
@@ -456,9 +484,19 @@ if st.session_state.analysis_df is not None and len(st.session_state.analysis_df
         # Show a sortable/filterable table
         st.markdown("### Results Table")
 
-        # Select columns to display
-        display_df = df[['filename', 'verdict', 'cutoff_khz', 'rolloff_db_per_khz', 'hf_minus_mid_db']].copy()
-        display_df.columns = ['Filename', 'Verdict', 'Cutoff (kHz)', 'Roll-off (dB/kHz)', 'HF-Mid (dB)']
+        # Add silence info column if silence detection was enabled
+        display_columns = ['filename', 'verdict', 'cutoff_khz', 'rolloff_db_per_khz', 'hf_minus_mid_db']
+        column_names = ['Filename', 'Verdict', 'Cutoff (kHz)', 'Roll-off (dB/kHz)', 'HF-Mid (dB)']
+
+        # Create display DataFrame
+        display_df = df[display_columns].copy()
+
+        # Add silence column if silence data exists
+        if 'has_silence_start' in df.columns or 'has_silence_end' in df.columns:
+            display_df['Silence'] = df.apply(format_silence_info, axis=1)
+            column_names.append('Silence')
+
+        display_df.columns = column_names
 
         # Format numbers
         display_df['Cutoff (kHz)'] = display_df['Cutoff (kHz)'].round(1)
@@ -472,8 +510,9 @@ if st.session_state.analysis_df is not None and len(st.session_state.analysis_df
         for idx, row in df.iterrows():
             with st.expander(f"{row['filename']} - {row['verdict']}", expanded=False):
                 # Show silence warning if detected
-                if row.get('has_silence_tail', False):
-                    st.warning(f"⚠️ Silence tail detected: {row['silence_duration_sec']:.1f} seconds")
+                silence_info = format_silence_info(row)
+                if silence_info:
+                    st.warning(f"⚠️ Silence detected: {silence_info}")
 
                 # Display metrics in columns
                 col_a, col_b = st.columns(2)
@@ -516,6 +555,67 @@ if st.session_state.analysis_df is not None and len(st.session_state.analysis_df
                         st.caption("Average frequency spectrum with cutoff highlighted")
                     else:
                         st.error("Cannot generate plots - file not available")
+
+    # Visualization section
+    st.markdown("---")
+    st.subheader("Visualize File")
+
+    # Dropdown to select file
+    file_options = df['filename'].tolist()
+    if file_options:
+        selected_file = st.selectbox(
+            "Select a file to visualize:",
+            file_options,
+            key="viz_file_selector"
+        )
+
+        # Get the selected file's data
+        selected_row = df[df['filename'] == selected_file].iloc[0]
+        file_path = selected_row['filepath']
+
+        # Display file info
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Verdict", selected_row['verdict'])
+        with col2:
+            st.metric("Cutoff Frequency", f"{selected_row['cutoff_khz']:.1f} kHz")
+        with col3:
+            st.metric("Sample Rate", f"{selected_row['sample_rate']} Hz")
+
+        # Audio player
+        st.markdown("#### Audio Player")
+        if os.path.exists(file_path):
+            st.audio(file_path)
+        else:
+            st.warning("Audio file no longer available")
+
+        # Generate and display plots
+        if os.path.exists(file_path):
+            with st.spinner("Generating visualizations..."):
+                try:
+                    # Load audio data
+                    data, sr = load_audio(file_path, mono=True)
+
+                    # Spectrogram
+                    st.markdown("#### Spectrogram")
+                    cutoffs_for_plot = [
+                        (18000, "MP3/Low-Bitrate Cutoff"),
+                        (21000, "High-Bitrate Transcode Cutoff")
+                    ]
+                    spec_img = plot_spectrogram(data, sr, classification_cutoffs=cutoffs_for_plot)
+                    st.image(spec_img)
+                    st.caption("Time-frequency representation with lossy codec cutoff indicators")
+
+                    # Frequency Spectrum
+                    st.markdown("#### Frequency Spectrum")
+                    spectrum_img = plot_spectrum(data, sr)
+                    st.image(spectrum_img)
+                    st.caption("Average frequency spectrum with cutoff highlighted")
+
+                except Exception as e:
+                    st.error(f"Error generating visualizations: {str(e)}")
+        else:
+            st.error("Cannot generate visualizations - file not available")
 
     # Export section
     st.markdown("---")
