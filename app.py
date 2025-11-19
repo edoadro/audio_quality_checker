@@ -17,6 +17,7 @@ import csv
 import json
 from datetime import datetime
 import glob
+import pandas as pd
 
 # Ensure librosa.display is available
 try:
@@ -245,6 +246,12 @@ The analysis checks for frequency cutoffs, roll-off slopes, and other characteri
 that can indicate if a file is truly lossless or has been converted from a lossy format.
 """)
 
+# Initialize session state
+if 'analysis_df' not in st.session_state:
+    st.session_state.analysis_df = None
+if 'temp_dir' not in st.session_state:
+    st.session_state.temp_dir = None
+
 # Analysis options
 st.subheader("Analysis Options")
 check_silence = st.checkbox("Check for silence tails (may increase processing time)", value=False)
@@ -271,15 +278,18 @@ if input_mode == "Upload Files":
         source_type = "upload"
 
 else:  # Analyze Folder
+    st.info("💡 **Tip:** You can drag a folder from Finder/Explorer into the text box below to paste its path")
+
     folder_path = st.text_input(
         "Enter folder path:",
-        placeholder="/path/to/your/music/folder",
-        help="Enter the full path to the folder containing audio files"
+        placeholder="e.g., /Users/yourname/Music or C:\\Users\\yourname\\Music",
+        help="Enter the full path to the folder containing audio files. You can drag a folder into this box to paste its path automatically.",
+        key="folder_path_input"
     )
 
     recursive = st.checkbox("Include subfolders", value=True)
 
-    if folder_path and st.button("Scan Folder"):
+    if folder_path and st.button("Scan Folder", type="primary"):
         if os.path.exists(folder_path) and os.path.isdir(folder_path):
             with st.spinner("Scanning folder..."):
                 found_files = scan_folder_for_audio(folder_path, recursive)
@@ -290,7 +300,7 @@ else:  # Analyze Folder
                 else:
                     st.warning(f"No audio files found in {folder_path}")
         else:
-            st.error("Invalid folder path")
+            st.error("Invalid folder path. Please check the path and try again.")
 
 if files_to_analyze:
     # Store results for export
@@ -325,10 +335,6 @@ if files_to_analyze:
         status_text.text(f"Analyzing {len(valid_files)} files...")
 
         # Create a temp directory for uploaded files only
-        # Store in session state to persist across reruns
-        if 'temp_dir' not in st.session_state:
-            st.session_state.temp_dir = None
-
         if source_type == "upload":
             if st.session_state.temp_dir is None or not os.path.exists(st.session_state.temp_dir):
                 st.session_state.temp_dir = tempfile.mkdtemp()
@@ -357,14 +363,23 @@ if files_to_analyze:
                     # Analyze the file
                     verdict, metrics = analyze_file(file_path, check_silence=check_silence)
 
-                    # Store results for export (including source type and temp path if upload)
-                    analysis_results.append({
+                    # Flatten metrics into the result row for easier DataFrame conversion
+                    result = {
                         'filename': file_name,
                         'filepath': file_path,
-                        'source_type': source_type,
                         'verdict': verdict,
-                        'metrics': metrics
-                    })
+                        'sample_rate': metrics.get('sample_rate'),
+                        'cutoff_hz': metrics.get('cutoff_hz'),
+                        'cutoff_khz': metrics.get('cutoff_hz', 0) / 1000.0,
+                        'rolloff_db_per_khz': metrics.get('rolloff_db_per_khz'),
+                        'hf_minus_mid_db': metrics.get('hf_minus_mid_db'),
+                        'hf_stereo_corr': metrics.get('hf_stereo_corr'),
+                        'bitdepth': metrics.get('bitdepth'),
+                        'zero_lsb_fraction': metrics.get('zero_lsb_fraction'),
+                        'has_silence_tail': metrics.get('has_silence_tail', False),
+                        'silence_duration_sec': metrics.get('silence_duration_sec', 0.0),
+                    }
+                    analysis_results.append(result)
 
                 except PermissionError:
                     st.error(f"❌ {file_name}: Permission denied - cannot access file")
@@ -379,148 +394,178 @@ if files_to_analyze:
             progress_bar.progress(1.0)
             status_text.text(f"Analysis complete! Analyzed {len(analysis_results)} of {len(valid_files)} files.")
 
-            # Filter and Sort controls
+            # Convert to DataFrame and store in session state
             if analysis_results:
-                st.markdown("---")
-                st.subheader("Filter and Sort Results")
-
-                col1, col2, col3 = st.columns(3)
-
-                with col1:
-                    filter_options = ["All Files", "Lossy/Problematic Only", "Lossless Only", "High Quality Only"]
-                    if check_silence:
-                        filter_options.append("Files with Silence Tails")
-                    filter_option = st.selectbox("Filter:", filter_options)
-
-                with col2:
-                    sort_option = st.selectbox(
-                        "Sort by:",
-                        ["Original Order", "Worst to Best", "Best to Worst", "Filename A-Z", "Filename Z-A", "Cutoff Frequency (Low to High)", "Cutoff Frequency (High to Low)"]
-                    )
-
-                with col3:
-                    show_metrics = st.checkbox("Show detailed metrics", value=False)
-
-                # Apply filters
-                filtered_results = analysis_results.copy()
-
-                if filter_option == "Lossy/Problematic Only":
-                    filtered_results = [r for r in filtered_results if any(keyword in r['verdict'].upper() for keyword in ['LOSSY', 'TRANSCODE', 'LOW', 'ESTIMATED BITRATE'])]
-                elif filter_option == "Lossless Only":
-                    filtered_results = [r for r in filtered_results if any(keyword in r['verdict'] for keyword in ['CD-quality', 'High-res', 'LOSSLESS', '💿', '🔊'])]
-                elif filter_option == "High Quality Only":
-                    filtered_results = [r for r in filtered_results if r['metrics']['cutoff_hz'] >= 20000]
-                elif filter_option == "Files with Silence Tails":
-                    filtered_results = [r for r in filtered_results if r['metrics'].get('has_silence_tail', False)]
-
-                # Apply sorting
-                if sort_option == "Worst to Best":
-                    filtered_results.sort(key=lambda x: x['metrics']['cutoff_hz'])
-                elif sort_option == "Best to Worst":
-                    filtered_results.sort(key=lambda x: x['metrics']['cutoff_hz'], reverse=True)
-                elif sort_option == "Filename A-Z":
-                    filtered_results.sort(key=lambda x: x['filename'])
-                elif sort_option == "Filename Z-A":
-                    filtered_results.sort(key=lambda x: x['filename'], reverse=True)
-                elif sort_option == "Cutoff Frequency (Low to High)":
-                    filtered_results.sort(key=lambda x: x['metrics']['cutoff_hz'])
-                elif sort_option == "Cutoff Frequency (High to Low)":
-                    filtered_results.sort(key=lambda x: x['metrics']['cutoff_hz'], reverse=True)
-
-                st.info(f"Showing {len(filtered_results)} of {len(analysis_results)} files")
-
-                # Display filtered and sorted results
-                st.markdown("---")
-                for i, result in enumerate(filtered_results):
-                    file_name = result['filename']
-                    verdict = result['verdict']
-                    metrics = result['metrics']
-                    file_path = result['filepath']
-                    result_source_type = result.get('source_type', 'folder')
-
-                    with st.expander(f"{file_name} - {verdict}", expanded=False):
-                        # Show silence warning if detected
-                        if metrics.get('has_silence_tail'):
-                            silence_duration = metrics.get('silence_duration_sec', 0)
-                            st.warning(f"⚠️ Silence tail detected: {silence_duration:.1f} seconds of silence at the end")
-
-                        if show_metrics:
-                            # Display detailed metrics
-                            col_a, col_b = st.columns(2)
-                            with col_a:
-                                st.metric("Sample Rate", f"{metrics['sample_rate']} Hz")
-                                st.metric("Cutoff Frequency", f"{metrics['cutoff_hz']:.0f} Hz ({metrics['cutoff_hz']/1000:.1f} kHz)")
-                                st.metric("Roll-off Slope", f"{metrics['rolloff_db_per_khz']:.1f} dB/kHz")
-                            with col_b:
-                                st.metric("HF vs Mid Difference", f"{metrics['hf_minus_mid_db']:.1f} dB")
-                                if metrics.get('hf_stereo_corr') is not None:
-                                    st.metric("HF Stereo Correlation", f"{metrics['hf_stereo_corr']:.2f}")
-                                if metrics.get('bitdepth'):
-                                    st.metric("Bit Depth", metrics['bitdepth'])
-                                if metrics.get('has_silence_tail'):
-                                    st.metric("Silence Tail", f"{metrics['silence_duration_sec']:.1f} sec")
-
-                        # Add audio player
-                        st.subheader("Play Audio")
-                        # Always use file path - works for both upload and folder modes
-                        if os.path.exists(file_path):
-                            st.audio(file_path)
-                        else:
-                            st.warning("Audio file no longer available (temporary file may have been cleaned up)")
-
-                        if st.button("Generate Plots", key=f"filtered_plot_{i}"):
-                            if os.path.exists(file_path):
-                                # Load audio for visualization
-                                data, sr = load_audio(file_path, mono=True)
-
-                                # Display Spectrogram
-                                st.subheader("Spectrogram")
-                                cutoffs_for_plot = [
-                                    (18000, "MP3/Low-Bitrate Cutoff"),
-                                    (21000, "High-Bitrate Transcode Cutoff")
-                                ]
-                                spec_img = plot_spectrogram(data, sr, classification_cutoffs=cutoffs_for_plot)
-                                st.image(spec_img)
-                                st.caption("Time-frequency representation of the audio signal, with lines indicating common lossy codec frequency cutoffs.")
-
-                                # Display Frequency Spectrum
-                                st.subheader("Frequency Spectrum")
-                                spec_img = plot_spectrum(data, sr)
-                                st.image(spec_img)
-                                st.caption("Average frequency spectrum (with cutoff highlighted)")
-                            else:
-                                st.error("Cannot generate plots - file no longer available")
+                st.session_state.analysis_df = pd.DataFrame(analysis_results)
+                st.success(f"✅ Successfully analyzed {len(analysis_results)} files!")
 
         finally:
             # Don't clean up temp directory - it's stored in session state
-            # and will be cleaned up when the session ends or on next analysis
             pass
 
-        # Export section
-        if analysis_results:
-            st.markdown("---")
-            st.subheader("Export Results")
-            col1, col2 = st.columns(2)
+# Display results section - OUTSIDE the analysis block
+# This runs every time and reads from session state
+st.markdown("---")
+if st.session_state.analysis_df is not None and len(st.session_state.analysis_df) > 0:
+    st.subheader("Analysis Results")
 
-            with col1:
-                csv_data = export_to_csv(analysis_results)
-                if csv_data:
-                    st.download_button(
-                        label="📥 Download CSV",
-                        data=csv_data,
-                        file_name=f"audio_quality_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv"
-                    )
+    df = st.session_state.analysis_df.copy()
 
-            with col2:
-                json_data = export_to_json(analysis_results)
-                if json_data:
-                    st.download_button(
-                        label="📥 Download JSON",
-                        data=json_data,
-                        file_name=f"audio_quality_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                        mime="application/json"
-                    )
+    # Filter and Sort controls
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        filter_options = ["All Files", "Lossy/Problematic Only", "Lossless Only", "High Quality Only"]
+        if 'has_silence_tail' in df.columns and df['has_silence_tail'].any():
+            filter_options.append("Files with Silence Tails")
+        filter_option = st.selectbox("Filter:", filter_options)
+
+    with col2:
+        sort_option = st.selectbox(
+            "Sort by:",
+            ["Original Order", "Worst to Best (Cutoff)", "Best to Worst (Cutoff)", "Filename A-Z", "Filename Z-A"]
+        )
+
+    with col3:
+        view_mode = st.radio("View:", ["Table", "Details"], horizontal=True)
+
+    # Apply filters using pandas
+    if filter_option == "Lossy/Problematic Only":
+        df = df[df['verdict'].str.upper().str.contains('LOSSY|TRANSCODE|LOW|ESTIMATED BITRATE', na=False)]
+    elif filter_option == "Lossless Only":
+        df = df[df['verdict'].str.contains('CD-quality|High-res|LOSSLESS|💿|🔊', na=False)]
+    elif filter_option == "High Quality Only":
+        df = df[df['cutoff_hz'] >= 20000]
+    elif filter_option == "Files with Silence Tails":
+        df = df[df['has_silence_tail'] == True]
+
+    # Apply sorting using pandas
+    if sort_option == "Worst to Best (Cutoff)":
+        df = df.sort_values('cutoff_hz')
+    elif sort_option == "Best to Worst (Cutoff)":
+        df = df.sort_values('cutoff_hz', ascending=False)
+    elif sort_option == "Filename A-Z":
+        df = df.sort_values('filename')
+    elif sort_option == "Filename Z-A":
+        df = df.sort_values('filename', ascending=False)
+
+    st.info(f"Showing {len(df)} of {len(st.session_state.analysis_df)} files")
+
+    # Display based on view mode
+    if view_mode == "Table":
+        # Show a sortable/filterable table
+        st.markdown("### Results Table")
+
+        # Select columns to display
+        display_df = df[['filename', 'verdict', 'cutoff_khz', 'rolloff_db_per_khz', 'hf_minus_mid_db']].copy()
+        display_df.columns = ['Filename', 'Verdict', 'Cutoff (kHz)', 'Roll-off (dB/kHz)', 'HF-Mid (dB)']
+
+        # Format numbers
+        display_df['Cutoff (kHz)'] = display_df['Cutoff (kHz)'].round(1)
+        display_df['Roll-off (dB/kHz)'] = display_df['Roll-off (dB/kHz)'].round(1)
+        display_df['HF-Mid (dB)'] = display_df['HF-Mid (dB)'].round(1)
+
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    else:  # Details view
+        st.markdown("### File Details")
+        for idx, row in df.iterrows():
+            with st.expander(f"{row['filename']} - {row['verdict']}", expanded=False):
+                # Show silence warning if detected
+                if row.get('has_silence_tail', False):
+                    st.warning(f"⚠️ Silence tail detected: {row['silence_duration_sec']:.1f} seconds")
+
+                # Display metrics in columns
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.metric("Sample Rate", f"{row['sample_rate']} Hz")
+                    st.metric("Cutoff Frequency", f"{row['cutoff_hz']:.0f} Hz ({row['cutoff_khz']:.1f} kHz)")
+                    st.metric("Roll-off Slope", f"{row['rolloff_db_per_khz']:.1f} dB/kHz")
+                with col_b:
+                    st.metric("HF vs Mid Difference", f"{row['hf_minus_mid_db']:.1f} dB")
+                    if pd.notna(row.get('hf_stereo_corr')):
+                        st.metric("HF Stereo Correlation", f"{row['hf_stereo_corr']:.2f}")
+                    if pd.notna(row.get('bitdepth')):
+                        st.metric("Bit Depth", row['bitdepth'])
+
+                # Add audio player
+                st.subheader("Play Audio")
+                file_path = row['filepath']
+                if os.path.exists(file_path):
+                    st.audio(file_path)
+                else:
+                    st.warning("Audio file no longer available")
+
+                # Generate plots button
+                if st.button("Generate Plots", key=f"plot_{idx}"):
+                    if os.path.exists(file_path):
+                        data, sr = load_audio(file_path, mono=True)
+
+                        st.subheader("Spectrogram")
+                        cutoffs_for_plot = [
+                            (18000, "MP3/Low-Bitrate Cutoff"),
+                            (21000, "High-Bitrate Transcode Cutoff")
+                        ]
+                        spec_img = plot_spectrogram(data, sr, classification_cutoffs=cutoffs_for_plot)
+                        st.image(spec_img)
+                        st.caption("Time-frequency representation with lossy codec cutoff indicators")
+
+                        st.subheader("Frequency Spectrum")
+                        spec_img = plot_spectrum(data, sr)
+                        st.image(spec_img)
+                        st.caption("Average frequency spectrum with cutoff highlighted")
+                    else:
+                        st.error("Cannot generate plots - file not available")
+
+    # Export section
+    st.markdown("---")
+    st.subheader("Export Results")
+
+    # Convert DataFrame back to the format expected by export functions
+    # Only compute this once per analysis run
+    export_data = []
+    for _, row in st.session_state.analysis_df.iterrows():
+        export_data.append({
+            'filename': row['filename'],
+            'verdict': row['verdict'],
+            'metrics': {
+                'sample_rate': row['sample_rate'],
+                'cutoff_hz': row['cutoff_hz'],
+                'rolloff_db_per_khz': row['rolloff_db_per_khz'],
+                'hf_minus_mid_db': row['hf_minus_mid_db'],
+                'hf_stereo_corr': row.get('hf_stereo_corr'),
+                'bitdepth': row.get('bitdepth'),
+                'zero_lsb_fraction': row.get('zero_lsb_fraction'),
+            }
+        })
+
+    # Generate export data
+    csv_data = export_to_csv(export_data)
+    json_data = export_to_json(export_data)
+
+    # Generate timestamp for filenames
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if csv_data:
+            st.download_button(
+                label="📥 Download CSV",
+                data=csv_data,
+                file_name=f"audio_quality_analysis_{timestamp}.csv",
+                mime="text/csv",
+                key="download_csv"
+            )
+
+    with col2:
+        if json_data:
+            st.download_button(
+                label="📥 Download JSON",
+                data=json_data,
+                file_name=f"audio_quality_analysis_{timestamp}.json",
+                mime="application/json",
+                key="download_json"
+            )
 
 st.markdown("---")
 st.markdown("### About This Tool")
