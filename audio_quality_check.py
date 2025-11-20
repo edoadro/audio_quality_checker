@@ -22,7 +22,10 @@ import librosa          # audio loading / resampling
 import soundfile as sf   # to check original bit‑depth
 from scipy.stats import pearsonr
 from scipy.signal import iirfilter, sosfilt  # equivalents of the missing librosa wrappers
+from scipy.interpolate import interp1d
 from tqdm import tqdm    # progress bar for long files
+import subprocess
+import tempfile
 
 # ---------------------------- CONFIG -------------------------------- #
 FRAME_LEN     = 4096        # STFT window
@@ -210,6 +213,206 @@ def detect_silence_tail(y, sr, silence_threshold_db=-50, min_silence_duration=1.
     has_silence_end = silence_end_duration >= min_silence_duration
 
     return has_silence_start, silence_start_duration, has_silence_end, silence_end_duration
+
+
+def spectral_correlation(freqs1, mag_db1, freqs2, mag_db2):
+    """
+    Calculate Pearson correlation between two magnitude spectra.
+    Interpolates to match frequency bins if needed.
+    Returns correlation coefficient (0-1).
+    """
+    # Ensure same frequency bins
+    if len(freqs1) != len(freqs2) or not np.allclose(freqs1, freqs2):
+        # Interpolate second spectrum to match first
+        interp_func = interp1d(freqs2, mag_db2, kind='linear', fill_value='extrapolate')
+        mag_db2_aligned = interp_func(freqs1)
+    else:
+        mag_db2_aligned = mag_db2
+
+    corr, _ = pearsonr(mag_db1, mag_db2_aligned)
+    return float(corr)
+
+
+def hf_energy_ratio(freqs, mag_db_orig, mag_db_reenc, hf_threshold=15000):
+    """
+    Compare high-frequency energy loss between original and re-encoded.
+    Returns energy ratio in dB (negative = loss).
+    """
+    hf_idx = freqs >= hf_threshold
+
+    if not np.any(hf_idx):
+        return 0.0  # No HF content in frequency range
+
+    # Convert dB back to linear amplitude for energy calculation
+    orig_amp = librosa.db_to_amplitude(mag_db_orig[hf_idx])
+    reenc_amp = librosa.db_to_amplitude(mag_db_reenc[hf_idx])
+
+    orig_energy = np.sum(orig_amp ** 2)
+    reenc_energy = np.sum(reenc_amp ** 2)
+
+    if orig_energy == 0:
+        return 0.0  # No original HF energy
+
+    ratio_db = 10 * np.log10(reenc_energy / orig_energy)
+    return float(ratio_db)
+
+
+def reencode_mp3(input_path, output_path, bitrate_kbps=320):
+    """
+    Re-encode audio to MP3 at specific bitrate using ffmpeg.
+    Returns True if successful, False otherwise.
+    """
+    cmd = [
+        'ffmpeg', '-y',  # Overwrite output
+        '-i', str(input_path),
+        '-c:a', 'libmp3lame',  # MP3 codec
+        '-b:a', f'{bitrate_kbps}k',  # Bitrate
+        '-q:a', '0',  # Highest quality encoding
+        '-loglevel', 'error',  # Only show errors
+        str(output_path)
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def verify_bitrate(original_path, test_bitrates=None):
+    """
+    Progressive re-encoding to detect true source bitrate.
+
+    Re-encodes the file at progressively lower bitrates and compares
+    spectral characteristics to find where significant differences appear.
+
+    Args:
+        original_path: Path to the original audio file
+        test_bitrates: List of bitrates to test (kbps), high to low
+
+    Returns:
+        tuple: (threshold_bitrate, results_dict, metadata)
+            - threshold_bitrate: Lowest bitrate before significant difference
+              (None if all similar or all different)
+            - results_dict: Dict mapping bitrate -> comparison metrics
+            - metadata: Dict with original file info (cutoff, quality estimate)
+    """
+    if test_bitrates is None:
+        test_bitrates = [320, 256, 192, 128, 96]
+
+    # Analyze original file
+    try:
+        orig_y, orig_sr = load_audio(original_path, mono=False)
+        if orig_y.ndim == 1:
+            orig_y = np.expand_dims(orig_y, axis=0)
+
+        orig_freqs, orig_mag_db = average_spectrum(np.mean(orig_y, axis=0), orig_sr)
+        orig_cutoff, orig_slope = find_cutoff(orig_freqs, orig_mag_db)
+    except Exception as e:
+        return None, {'error': f'Failed to analyze original file: {str(e)}'}, {}
+
+    # Adaptive thresholds based on original file quality
+    # If original already has low cutoff (<20kHz), it's already lossy
+    orig_cutoff_khz = orig_cutoff / 1000.0
+
+    if orig_cutoff_khz < 18.0:
+        # Already obviously lossy - use tighter thresholds
+        cutoff_threshold = 1000  # 1 kHz tolerance
+        corr_threshold = 0.98    # Very high correlation required
+        hf_loss_threshold = -6   # Less HF loss tolerance
+        quality_note = "already_lossy"
+    elif orig_cutoff_khz < 20.0:
+        # Borderline/high-bitrate lossy - moderate thresholds
+        cutoff_threshold = 800
+        corr_threshold = 0.96
+        hf_loss_threshold = -8
+        quality_note = "borderline"
+    else:
+        # Appears lossless - use original thresholds
+        cutoff_threshold = 500
+        corr_threshold = 0.95
+        hf_loss_threshold = -10
+        quality_note = "high_quality"
+
+    metadata = {
+        'original_cutoff_hz': float(orig_cutoff),
+        'original_cutoff_khz': float(orig_cutoff_khz),
+        'original_slope': float(orig_slope),
+        'quality_note': quality_note,
+        'thresholds_used': {
+            'cutoff_drop_hz': cutoff_threshold,
+            'spectral_correlation': corr_threshold,
+            'hf_energy_loss_db': hf_loss_threshold
+        }
+    }
+
+    results = {}
+    threshold_bitrate = None
+    significant_differences = 0  # Count how many metrics show difference
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for bitrate in sorted(test_bitrates, reverse=True):  # High to low
+            # Re-encode at this bitrate
+            reenc_path = Path(tmpdir) / f"reenc_{bitrate}kbps.mp3"
+
+            if not reencode_mp3(original_path, reenc_path, bitrate):
+                results[bitrate] = {
+                    'error': 'Encoding failed (ffmpeg not available?)',
+                    'is_different': None
+                }
+                continue
+
+            try:
+                # Analyze re-encoded file
+                reenc_y, reenc_sr = load_audio(str(reenc_path), mono=False)
+                if reenc_y.ndim == 1:
+                    reenc_y = np.expand_dims(reenc_y, axis=0)
+
+                reenc_freqs, reenc_mag_db = average_spectrum(np.mean(reenc_y, axis=0), reenc_sr)
+                reenc_cutoff, _ = find_cutoff(reenc_freqs, reenc_mag_db)
+
+                # Compare metrics
+                cutoff_diff = orig_cutoff - reenc_cutoff
+                spec_corr = spectral_correlation(orig_freqs, orig_mag_db, reenc_freqs, reenc_mag_db)
+                hf_ratio = hf_energy_ratio(orig_freqs, orig_mag_db, reenc_mag_db)
+
+                # Count how many metrics exceed thresholds (require at least 2 of 3)
+                metrics_exceeded = 0
+                if cutoff_diff > cutoff_threshold:
+                    metrics_exceeded += 1
+                if spec_corr < corr_threshold:
+                    metrics_exceeded += 1
+                if hf_ratio < hf_loss_threshold:
+                    metrics_exceeded += 1
+
+                # Require at least 2 metrics to agree for "different"
+                is_different = metrics_exceeded >= 2
+
+                results[bitrate] = {
+                    'cutoff_drop_hz': float(cutoff_diff),
+                    'spectral_correlation': float(spec_corr),
+                    'hf_energy_loss_db': float(hf_ratio),
+                    'is_different': is_different,
+                    'metrics_exceeded': metrics_exceeded,
+                    'reencoded_cutoff_hz': float(reenc_cutoff)
+                }
+
+                # Set threshold if this is first significant difference
+                if is_different and threshold_bitrate is None:
+                    threshold_bitrate = bitrate
+
+            except Exception as e:
+                results[bitrate] = {
+                    'error': f'Analysis failed: {str(e)}',
+                    'is_different': None
+                }
+
+    return threshold_bitrate, results, metadata
 
 
 def analyze_file(path, check_silence=False):

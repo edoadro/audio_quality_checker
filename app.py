@@ -27,7 +27,7 @@ except ImportError:
     st.stop()
 
 # Import functions from the audio_quality_check module
-from audio_quality_check import analyze_file, load_audio, average_spectrum
+from audio_quality_check import analyze_file, load_audio, average_spectrum, verify_bitrate
 
 # Configuration constants
 MAX_FILE_SIZE_MB = 500  # Maximum file size in MB
@@ -614,6 +614,106 @@ if st.session_state.analysis_df is not None and len(st.session_state.analysis_df
 
                 except Exception as e:
                     st.error(f"Error generating visualizations: {str(e)}")
+
+            # Bitrate Verification Section
+            st.markdown("---")
+            st.markdown("#### Bitrate Verification")
+            st.write("Re-encode at lower bitrates to verify if this file is genuinely high-quality or upsampled from lossy.")
+
+            if st.button("Verify True Bitrate", key=f"verify_{selected_file}"):
+                with st.spinner("Re-encoding and analyzing... This may take 30-60 seconds."):
+                    try:
+                        threshold, results, metadata = verify_bitrate(file_path)
+
+                        # Display verdict
+                        if 'error' in results:
+                            st.error(f"Verification failed: {results['error']}")
+                        else:
+                            # Show original file info
+                            quality_note = metadata.get('quality_note', 'unknown')
+                            orig_cutoff_khz = metadata.get('original_cutoff_khz', 0)
+
+                            if quality_note == "already_lossy":
+                                st.info(f"**Original file analysis:** Already shows lossy characteristics (cutoff at {orig_cutoff_khz:.1f} kHz). Using stricter comparison thresholds.")
+                            elif quality_note == "borderline":
+                                st.info(f"**Original file analysis:** Borderline quality (cutoff at {orig_cutoff_khz:.1f} kHz). Using moderate comparison thresholds.")
+                            # Determine verdict message
+                            if threshold is None:
+                                # Check if all were similar or all different
+                                all_similar = all(
+                                    not r.get('is_different', True)
+                                    for r in results.values()
+                                    if 'error' not in r
+                                )
+                                if all_similar:
+                                    st.success("File appears to be genuine high-quality audio - no significant degradation detected even at lowest tested bitrate (96 kbps)")
+                                else:
+                                    st.warning("File shows degradation at all tested bitrates - may already be very low quality")
+                            else:
+                                st.warning(f"True source appears to be **≤ {threshold} kbps** quality")
+                                st.info("The file shows significant spectral differences when re-encoded at this bitrate, suggesting the original was encoded at or below this quality.")
+
+                            # Display detailed comparison table
+                            st.markdown("##### Detailed Comparison Results")
+
+                            # Create DataFrame for results table
+                            table_data = []
+                            for bitrate in sorted(results.keys(), reverse=True):
+                                result = results[bitrate]
+                                if 'error' in result:
+                                    status = f"Error: {result['error']}"
+                                    cutoff_drop = "-"
+                                    spec_corr = "-"
+                                    hf_loss = "-"
+                                else:
+                                    status = "Different" if result['is_different'] else "Similar"
+                                    cutoff_drop = f"{result['cutoff_drop_hz']:.0f} Hz"
+                                    spec_corr = f"{result['spectral_correlation']:.3f}"
+                                    hf_loss = f"{result['hf_energy_loss_db']:.1f} dB"
+
+                                table_data.append({
+                                    'Bitrate (kbps)': bitrate,
+                                    'Status': status,
+                                    'Cutoff Drop': cutoff_drop,
+                                    'Spectral Correlation': spec_corr,
+                                    'HF Energy Loss': hf_loss
+                                })
+
+                            results_df = pd.DataFrame(table_data)
+                            st.dataframe(results_df, use_container_width=True, hide_index=True)
+
+                            # Interpretation guide
+                            with st.expander("How to interpret these results"):
+                                thresholds = metadata.get('thresholds_used', {})
+                                st.markdown(f"""
+                                **Status:**
+                                - **Similar**: Re-encoding at this bitrate produces negligible changes - file may be genuine high quality
+                                - **Different**: Significant spectral degradation detected (2+ metrics exceeded thresholds) - file likely originated at or below this bitrate
+
+                                **Metrics:**
+                                - **Cutoff Drop**: Frequency cutoff reduction (>{thresholds.get('cutoff_drop_hz', 500)} Hz threshold)
+                                - **Spectral Correlation**: Similarity of frequency spectrum (<{thresholds.get('spectral_correlation', 0.95)} threshold)
+                                - **HF Energy Loss**: High-frequency energy reduction (<{thresholds.get('hf_energy_loss_db', -10)} dB threshold)
+
+                                **Detection Logic:**
+                                A bitrate is marked "Different" only when **at least 2 out of 3 metrics** exceed their thresholds.
+                                This reduces false positives from measurement noise.
+
+                                **Adaptive Thresholds:**
+                                The system automatically adjusts thresholds based on the original file's quality:
+                                - **High quality** (>20 kHz cutoff): Standard thresholds
+                                - **Borderline** (18-20 kHz): Tighter thresholds to account for existing lossy artifacts
+                                - **Already lossy** (<18 kHz): Strictest thresholds, as file is already compromised
+
+                                **What this means:**
+                                If re-encoding at 192 kbps shows "Different" but 256 kbps shows "Similar", the file was likely
+                                encoded at 192-256 kbps originally and then upsampled to a lossless format.
+                                """)
+
+                    except Exception as e:
+                        st.error(f"Verification error: {str(e)}")
+                        st.info("Make sure ffmpeg is installed: `brew install ffmpeg` (macOS) or `apt install ffmpeg` (Linux)")
+
         else:
             st.error("Cannot generate visualizations - file not available")
 
