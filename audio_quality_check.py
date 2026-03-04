@@ -284,23 +284,27 @@ def reencode_mp3(input_path, output_path, bitrate_kbps=320):
         return False
 
 
-def verify_bitrate(original_path, test_bitrates=None):
+def verify_bitrate(original_path, test_bitrates=None, callback=None):
     """
     Progressive re-encoding to detect true source bitrate.
 
-    Re-encodes the file at progressively lower bitrates and compares
-    spectral characteristics to find where significant differences appear.
+    Simplified logic: Compare cutoff frequency drop and file size changes.
+    If a file is truly high quality, re-encoding at lower bitrate should cause:
+    1. Significant cutoff frequency reduction (lossy codec brick-wall filter)
+    2. Noticeable file size reduction (compression working)
 
     Args:
         original_path: Path to the original audio file
         test_bitrates: List of bitrates to test (kbps), high to low
+        callback: Optional function to call with progress updates
+                  callback(step, bitrate, result_dict) -> bool (return True to stop early)
 
     Returns:
-        tuple: (threshold_bitrate, results_dict, metadata)
-            - threshold_bitrate: Lowest bitrate before significant difference
-              (None if all similar or all different)
-            - results_dict: Dict mapping bitrate -> comparison metrics
-            - metadata: Dict with original file info (cutoff, quality estimate)
+        tuple: (verdict, final_bitrate, all_results, metadata)
+            - verdict: "genuine" or "fake"
+            - final_bitrate: Detected source bitrate (or None if genuine)
+            - all_results: List of dicts with step-by-step results
+            - metadata: Dict with original file info
     """
     if test_bitrates is None:
         test_bitrates = [320, 256, 192, 128, 96]
@@ -313,58 +317,38 @@ def verify_bitrate(original_path, test_bitrates=None):
 
         orig_freqs, orig_mag_db = average_spectrum(np.mean(orig_y, axis=0), orig_sr)
         orig_cutoff, orig_slope = find_cutoff(orig_freqs, orig_mag_db)
+        orig_file_size = os.path.getsize(original_path)
     except Exception as e:
-        return None, {'error': f'Failed to analyze original file: {str(e)}'}, {}
+        return "error", None, [], {'error': f'Failed to analyze original file: {str(e)}'}
 
-    # Adaptive thresholds based on original file quality
-    # If original already has low cutoff (<20kHz), it's already lossy
     orig_cutoff_khz = orig_cutoff / 1000.0
-
-    if orig_cutoff_khz < 18.0:
-        # Already obviously lossy - use tighter thresholds
-        cutoff_threshold = 1000  # 1 kHz tolerance
-        corr_threshold = 0.98    # Very high correlation required
-        hf_loss_threshold = -6   # Less HF loss tolerance
-        quality_note = "already_lossy"
-    elif orig_cutoff_khz < 20.0:
-        # Borderline/high-bitrate lossy - moderate thresholds
-        cutoff_threshold = 800
-        corr_threshold = 0.96
-        hf_loss_threshold = -8
-        quality_note = "borderline"
-    else:
-        # Appears lossless - use original thresholds
-        cutoff_threshold = 500
-        corr_threshold = 0.95
-        hf_loss_threshold = -10
-        quality_note = "high_quality"
 
     metadata = {
         'original_cutoff_hz': float(orig_cutoff),
         'original_cutoff_khz': float(orig_cutoff_khz),
         'original_slope': float(orig_slope),
-        'quality_note': quality_note,
-        'thresholds_used': {
-            'cutoff_drop_hz': cutoff_threshold,
-            'spectral_correlation': corr_threshold,
-            'hf_energy_loss_db': hf_loss_threshold
-        }
+        'original_file_size_mb': float(orig_file_size / (1024 * 1024))
     }
 
-    results = {}
-    threshold_bitrate = None
-    significant_differences = 0  # Count how many metrics show difference
+    all_results = []
+    detected_bitrate = None
+    verdict = "genuine"  # Assume genuine until proven otherwise
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        for bitrate in sorted(test_bitrates, reverse=True):  # High to low
+        for step, bitrate in enumerate(sorted(test_bitrates, reverse=True), 1):
             # Re-encode at this bitrate
             reenc_path = Path(tmpdir) / f"reenc_{bitrate}kbps.mp3"
 
             if not reencode_mp3(original_path, reenc_path, bitrate):
-                results[bitrate] = {
-                    'error': 'Encoding failed (ffmpeg not available?)',
-                    'is_different': None
+                result = {
+                    'step': step,
+                    'bitrate': bitrate,
+                    'error': 'Encoding failed',
+                    'status': 'error'
                 }
+                all_results.append(result)
+                if callback:
+                    callback(step, bitrate, result)
                 continue
 
             try:
@@ -375,44 +359,61 @@ def verify_bitrate(original_path, test_bitrates=None):
 
                 reenc_freqs, reenc_mag_db = average_spectrum(np.mean(reenc_y, axis=0), reenc_sr)
                 reenc_cutoff, _ = find_cutoff(reenc_freqs, reenc_mag_db)
+                reenc_file_size = os.path.getsize(reenc_path)
 
-                # Compare metrics
-                cutoff_diff = orig_cutoff - reenc_cutoff
-                spec_corr = spectral_correlation(orig_freqs, orig_mag_db, reenc_freqs, reenc_mag_db)
-                hf_ratio = hf_energy_ratio(orig_freqs, orig_mag_db, reenc_mag_db)
+                # Calculate differences
+                cutoff_drop_hz = orig_cutoff - reenc_cutoff
+                cutoff_drop_khz = cutoff_drop_hz / 1000.0
+                size_ratio = (reenc_file_size / orig_file_size) * 100
 
-                # Count how many metrics exceed thresholds (require at least 2 of 3)
-                metrics_exceeded = 0
-                if cutoff_diff > cutoff_threshold:
-                    metrics_exceeded += 1
-                if spec_corr < corr_threshold:
-                    metrics_exceeded += 1
-                if hf_ratio < hf_loss_threshold:
-                    metrics_exceeded += 1
+                # Detection logic
+                cutoff_unchanged = cutoff_drop_khz < 1.0
+                size_unchanged = size_ratio > 85
+                is_same_quality = cutoff_unchanged and size_unchanged
 
-                # Require at least 2 metrics to agree for "different"
-                is_different = metrics_exceeded >= 2
-
-                results[bitrate] = {
-                    'cutoff_drop_hz': float(cutoff_diff),
-                    'spectral_correlation': float(spec_corr),
-                    'hf_energy_loss_db': float(hf_ratio),
-                    'is_different': is_different,
-                    'metrics_exceeded': metrics_exceeded,
-                    'reencoded_cutoff_hz': float(reenc_cutoff)
+                result = {
+                    'step': step,
+                    'bitrate': bitrate,
+                    'orig_cutoff_khz': float(orig_cutoff_khz),
+                    'new_cutoff_khz': float(reenc_cutoff / 1000.0),
+                    'cutoff_drop_khz': float(cutoff_drop_khz),
+                    'orig_size_mb': float(orig_file_size / (1024 * 1024)),
+                    'new_size_mb': float(reenc_file_size / (1024 * 1024)),
+                    'size_ratio_percent': float(size_ratio),
+                    'is_same_quality': is_same_quality,
+                    'status': 'same' if is_same_quality else 'changed'
                 }
 
-                # Set threshold if this is first significant difference
-                if is_different and threshold_bitrate is None:
-                    threshold_bitrate = bitrate
+                all_results.append(result)
+
+                # Callback for progressive display
+                if callback:
+                    should_stop = callback(step, bitrate, result)
+                    if should_stop:
+                        break
+
+                # If quality changed significantly, file is genuine - stop early
+                if not is_same_quality:
+                    verdict = "genuine"
+                    break
+
+                # If no change, file is fake at this bitrate
+                if is_same_quality and detected_bitrate is None:
+                    detected_bitrate = bitrate
+                    verdict = "fake"
 
             except Exception as e:
-                results[bitrate] = {
-                    'error': f'Analysis failed: {str(e)}',
-                    'is_different': None
+                result = {
+                    'step': step,
+                    'bitrate': bitrate,
+                    'error': str(e),
+                    'status': 'error'
                 }
+                all_results.append(result)
+                if callback:
+                    callback(step, bitrate, result)
 
-    return threshold_bitrate, results, metadata
+    return verdict, detected_bitrate, all_results, metadata
 
 
 def analyze_file(path, check_silence=False):
